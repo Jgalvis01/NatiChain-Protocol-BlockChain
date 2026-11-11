@@ -41,19 +41,19 @@ contract ReputationRegistry {
     }
 
     modifier onlyAuthorizedCircle() {
-        if (!authorizedCircles[msg.sender] && msg.sender != owner && msg.sender != factory) {
+        if (!authorizedCircles[msg.sender]) {
             revert Unauthorized();
         }
         _;
     }
 
     function setFactory(address _factory) external {
-        if (msg.sender != owner) revert Unauthorized();
+        if (msg.sender != owner || factory != address(0) || _factory.code.length == 0) revert Unauthorized();
         factory = _factory;
     }
 
     function registerCircle(address circle) external {
-        if (msg.sender != factory && msg.sender != owner) revert Unauthorized();
+        if (msg.sender != factory) revert Unauthorized();
         authorizedCircles[circle] = true;
         emit CircleAuthorized(circle);
     }
@@ -66,7 +66,9 @@ contract ReputationRegistry {
         if (hasVouched[msg.sender][candidate]) revert AlreadyVouched();
 
         uint256 voucherScore = getReputationScore(msg.sender);
-        if (voucherScore < 500) revert LowVoucherReputation();
+        if (voucherScore < 500 || reputations[msg.sender].circlesCompletedClean == 0) {
+            revert LowVoucherReputation();
+        }
 
         hasVouched[msg.sender][candidate] = true;
         reputations[candidate].socialEndorsements += 1;

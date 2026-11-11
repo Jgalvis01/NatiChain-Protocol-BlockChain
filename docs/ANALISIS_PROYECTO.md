@@ -1,5 +1,7 @@
 # Análisis del Proyecto #3: Círculos de Ahorro Comunitario (Blockchain)
 
+> La [revisión y correcciones de blockchain y sorteo](./REVISION_BLOCKCHAIN_Y_SORTEO.md) describe el mecanismo vigente: cierre de entradas, solicitud asíncrona, adaptador VRF y barajado verificable. En Anvil se usa una fuente explícitamente simulada. Los diagramas siguientes resumen el flujo general.
+
 ## 1. Comprensión del Problema y Contexto
 En Latinoamérica (especialmente en Colombia), existen dos variantes principales de ahorro comunitario mencionadas en el enunciado:
 1. **La "Cadena" o Pasanaku (ROSCA - *Rotating Savings and Credit Association*):** Un grupo de $N$ participantes aporta una cuota fija cada periodo. En cada ronda, uno de los participantes recibe el pozo acumulado de ese periodo (adjudicado por sorteo o turno). El ciclo termina cuando todos han recibido el pozo una vez.

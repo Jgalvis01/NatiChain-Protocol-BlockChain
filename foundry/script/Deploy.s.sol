@@ -6,11 +6,15 @@ import {MockYieldVault} from "../src/MockYieldVault.sol";
 import {ReputationRegistry} from "../src/ReputationRegistry.sol";
 import {SavingsCircle} from "../src/SavingsCircle.sol";
 import {SavingsCircleFactory} from "../src/SavingsCircleFactory.sol";
+import {MockRandomnessProvider} from "../src/MockRandomnessProvider.sol";
+import {VRFRandomnessProvider} from "../src/VRFRandomnessProvider.sol";
 
 interface VmScript {
     function startBroadcast(uint256 privateKey) external;
     function stopBroadcast() external;
     function envOr(string calldata name, uint256 defaultValue) external view returns (uint256);
+    function envOr(string calldata name, address defaultValue) external view returns (address);
+    function envOr(string calldata name, bytes32 defaultValue) external view returns (bytes32);
 }
 
 contract DeployScript {
@@ -22,21 +26,40 @@ contract DeployScript {
             MockStablecoin stablecoin,
             MockYieldVault yieldVault,
             ReputationRegistry reputation,
-            SavingsCircleFactory factory
+            SavingsCircleFactory factory,
+            address randomness
         )
     {
         // Clave privada por defecto de la cuenta #0 de Anvil
         uint256 deployerPrivateKey = vm.envOr(
             "PRIVATE_KEY",
-            0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+            block.chainid == 31337 ? uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80) : 0
         );
+        require(deployerPrivateKey != 0, "PRIVATE_KEY required outside Anvil");
 
         vm.startBroadcast(deployerPrivateKey);
 
         stablecoin = new MockStablecoin();
         yieldVault = new MockYieldVault(address(stablecoin));
         reputation = new ReputationRegistry();
-        factory = new SavingsCircleFactory(address(stablecoin), address(yieldVault), address(reputation));
+        if (block.chainid == 31337) {
+            randomness = address(new MockRandomnessProvider());
+        } else {
+            uint256 confirmations = vm.envOr("VRF_CONFIRMATIONS", uint256(3));
+            require(confirmations >= 3 && confirmations <= 200, "Invalid VRF confirmations");
+            randomness = address(
+                new VRFRandomnessProvider(
+                    vm.envOr("VRF_COORDINATOR", address(0)),
+                    vm.envOr("VRF_SUB_ID", uint256(0)),
+                    vm.envOr("VRF_KEY_HASH", bytes32(0)),
+                    uint16(confirmations),
+                    200_000,
+                    vm.envOr("VRF_NATIVE_PAYMENT", uint256(0)) == 1
+                )
+            );
+        }
+        factory = new SavingsCircleFactory(address(stablecoin), address(yieldVault), address(reputation), randomness);
+        if (block.chainid != 31337) VRFRandomnessProvider(randomness).setFactory(address(factory));
 
         stablecoin.setAuthorizedMinter(address(yieldVault), true);
         reputation.setFactory(address(factory));
@@ -59,12 +82,12 @@ contract DeployScript {
             SavingsCircle.CircleParams({
                 name: "Cadena Emprendedores (Turnos)",
                 contributionAmount: 100e18,
-                collateralAmount: 150e18,
+                collateralAmount: 330e18,
                 maxParticipants: 3,
                 roundDuration: 7 days,
                 gracePeriod: 3 days,
                 latePenaltyBps: 1000, // 10%
-                yieldRateBps: 200,    // 2% por ronda
+                yieldRateBps: 200, // 2% por ronda
                 payoutMode: SavingsCircle.PayoutMode.ROSCA
             })
         );
@@ -73,12 +96,12 @@ contract DeployScript {
             SavingsCircle.CircleParams({
                 name: "Natillera Fin de Ano (Cierre)",
                 contributionAmount: 200e18,
-                collateralAmount: 250e18,
+                collateralAmount: 840e18,
                 maxParticipants: 4,
                 roundDuration: 15 days,
                 gracePeriod: 5 days,
                 latePenaltyBps: 500, // 5%
-                yieldRateBps: 300,   // 3% por ronda
+                yieldRateBps: 300, // 3% por ronda
                 payoutMode: SavingsCircle.PayoutMode.ASCA
             })
         );

@@ -31,6 +31,8 @@ contract SavingsCircleFactory {
     address public immutable stablecoin;
     address public immutable yieldVault;
     ReputationRegistry public immutable reputationRegistry;
+    address public immutable randomnessProvider;
+    mapping(address => bool) public isCircle;
 
     address[] public allCircles;
 
@@ -43,10 +45,11 @@ contract SavingsCircleFactory {
         uint256 maxParticipants
     );
 
-    constructor(address _stablecoin, address _yieldVault, address _reputationRegistry) {
+    constructor(address _stablecoin, address _yieldVault, address _reputationRegistry, address _randomnessProvider) {
         stablecoin = _stablecoin;
         yieldVault = _yieldVault;
         reputationRegistry = ReputationRegistry(_reputationRegistry);
+        randomnessProvider = _randomnessProvider;
     }
 
     /**
@@ -54,24 +57,16 @@ contract SavingsCircleFactory {
      */
     function createCircle(SavingsCircle.CircleParams calldata params) external returns (address circleAddress) {
         SavingsCircle newCircle = new SavingsCircle(
-            stablecoin,
-            yieldVault,
-            address(reputationRegistry),
-            msg.sender,
-            params
+            stablecoin, yieldVault, address(reputationRegistry), msg.sender, randomnessProvider, params
         );
 
         circleAddress = address(newCircle);
+        isCircle[circleAddress] = true;
         allCircles.push(circleAddress);
         reputationRegistry.registerCircle(circleAddress);
 
         emit CircleCreated(
-            circleAddress,
-            msg.sender,
-            params.name,
-            params.payoutMode,
-            params.contributionAmount,
-            params.maxParticipants
+            circleAddress, msg.sender, params.name, params.payoutMode, params.contributionAmount, params.maxParticipants
         );
     }
 
@@ -95,13 +90,11 @@ contract SavingsCircleFactory {
             (
                 SavingsCircle.CircleParams memory p,
                 SavingsCircle.CircleState st,
-                uint256 curRound,
-                ,
+                uint256 curRound,,
                 uint256 pCount,
                 uint256 locked,
                 uint256 yieldGen,
-                uint256 penaltiesGen,
-                ,
+                uint256 penaltiesGen,,
             ) = circle.getCircleOverview();
 
             cards[i] = CircleCard({

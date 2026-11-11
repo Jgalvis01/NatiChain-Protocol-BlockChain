@@ -7,7 +7,7 @@ import {MockStablecoin} from "./MockStablecoin.sol";
  * @title MockYieldVault
  * @notice Simulador de un protocolo de rendimiento DeFi (ej. Aave / Compound / RWA Treasury)
  *         que custodia el saldo bloqueado de cada Círculo de Ahorro y genera un rendimiento base
- *         determinístico por ronda para proteger el ahorro frente a la inflación.
+ *         simulado por ronda, sin reinvertir intereses ni garantizar protección frente a la inflación.
  */
 contract MockYieldVault {
     MockStablecoin public immutable stablecoin;

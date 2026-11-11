@@ -7,7 +7,7 @@ export const DEFAULT_ADDRESSES = {
   stablecoin: '0x5FbDB2315678afecb367f032d93F642f64180aa3' as `0x${string}`,
   yieldVault: '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512' as `0x${string}`,
   reputation: '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0' as `0x${string}`,
-  factory: '0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9' as `0x${string}`,
+  factory: '0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9' as `0x${string}`,
 };
 
 export interface DemoWallet {
@@ -89,10 +89,18 @@ export const SAVINGS_CIRCLE_ABI = parseAbi([
   'function getCircleOverview() view returns (CircleParams _params, uint8 _state, uint256 _currentRound, uint256 _currentTime, uint256 _participantsCount, uint256 _vaultLockedPrincipal, uint256 _totalYieldGenerated, uint256 _totalPenaltiesCollected, uint256 _totalOnTimeShares, bytes32 _verifiableSeed)',
   'function getAllParticipantsInfo() view returns (ParticipantInfo[])',
   'function getTurnOrder() view returns (address[])',
+  'function getDrawDetails() view returns (address provider, bool demo, uint256 requestId, bytes32 commitment, bool fulfilled, uint256 word, uint256 deadline)',
+  'function getParticipants() view returns (address[])',
+  'function finalizeDraw()',
+  'function cancelUnfilledCircle()',
+  'function claimCancelledCollateral()',
   'function getRoundStatuses(uint256 roundNum) view returns (uint8[])',
   'function getAllRoundSummaries() view returns (RoundSummary[])',
   'function joinCircle()',
   'function payContribution()',
   'function settleCurrentRound()',
-  'function advanceVirtualTime(uint256 secondsToAdd)',
+]);
+
+export const RANDOMNESS_ABI = parseAbi([
+  'function fulfill(uint256 requestId, uint256 word)',
 ]);

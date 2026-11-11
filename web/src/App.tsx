@@ -1,11 +1,13 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   createPublicClient,
   createWalletClient,
+  createTestClient,
   http,
   formatEther,
   parseEther,
   custom,
+  BaseError,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { foundry } from 'viem/chains';
@@ -39,12 +41,39 @@ import {
   REPUTATION_ABI,
   FACTORY_ABI,
   SAVINGS_CIRCLE_ABI,
+  RANDOMNESS_ABI,
 } from './contracts/abis';
+import { verifyDraw } from './contracts/draw';
 
 const publicClient = createPublicClient({
   chain: foundry,
   transport: http(ANVIL_RPC_URL),
 });
+
+const errorMessage = (error: unknown) => error instanceof BaseError ? error.shortMessage
+  : error instanceof Error ? error.message : String(error);
+
+const waitForSuccessfulTransaction = async (hash: `0x${string}`) => {
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== 'success') throw new Error('La transacción fue revertida; el cambio no se realizó.');
+  return receipt;
+};
+
+// Consulta un mismo bloque y evita pagar accidentalmente otra ronda al usar datos de pantalla antiguos.
+const ensureRoundAcceptsPayments = async (circle: `0x${string}`, expectedRound: bigint) => {
+  const blockNumber = await publicClient.getBlockNumber({ cacheTime: 0 });
+  const [overview, rounds] = await Promise.all([
+    publicClient.readContract({ address: circle, abi: SAVINGS_CIRCLE_ABI, functionName: 'getCircleOverview', blockNumber }),
+    publicClient.readContract({ address: circle, abi: SAVINGS_CIRCLE_ABI, functionName: 'getAllRoundSummaries', blockNumber }),
+  ]);
+  if (overview[1] !== 1 || overview[2] !== expectedRound) {
+    throw new Error('La ronda cambió o el círculo ya no está activo. Actualiza los datos antes de pagar.');
+  }
+  const round = rounds[Number(expectedRound) - 1];
+  if (!round || overview[3] >= round.endTime) {
+    throw new Error('El plazo de pago venció. Liquida la ronda para cubrir los impagos con la garantía.');
+  }
+};
 
 interface CircleCardData {
   circleAddress: `0x${string}`;
@@ -91,6 +120,9 @@ interface RoundSummaryData {
 }
 
 interface CircleDetailData {
+  circleAddress: `0x${string}`;
+  viewerAddress: `0x${string}`;
+  selectionVersion: number;
   params: {
     name: string;
     contributionAmount: bigint;
@@ -115,6 +147,8 @@ interface CircleDetailData {
   turnOrder: `0x${string}`[];
   roundStatuses: number[];
   roundSummaries: RoundSummaryData[];
+  draw: { provider: `0x${string}`; demo: boolean; requestId: bigint; commitment: `0x${string}`;
+    fulfilled: boolean; word: bigint; deadline: bigint };
 }
 
 interface UserRepStats {
@@ -151,7 +185,7 @@ export function App() {
 
   const [circles, setCircles] = useState<CircleCardData[]>([]);
   const [selectedCircleAddr, setSelectedCircleAddr] = useState<`0x${string}` | null>(null);
-  const [circleDetail, setCircleDetail] = useState<CircleDetailData | null>(null);
+  const [loadedCircleDetail, setCircleDetail] = useState<CircleDetailData | null>(null);
   const [memberScores, setMemberScores] = useState<Record<string, number>>({});
 
   // Modal de creación de nuevo círculo paramétrico
@@ -160,7 +194,7 @@ export function App() {
     name: 'Cadena Comunitaria Cafeteros',
     payoutMode: 0, // 0 = ROSCA (Turnos), 1 = ASCA (Natillera Cierre)
     contributionAmount: '100',
-    collateralAmount: '150',
+    collateralAmount: '330',
     maxParticipants: '3',
     roundDurationDays: '7',
     gracePeriodDays: '3',
@@ -172,6 +206,17 @@ export function App() {
     useBrowserWallet && browserAddress
       ? browserAddress
       : DEMO_WALLETS[selectedWalletIndex].address;
+
+  // La selección invalida inmediatamente los datos anteriores, antes de que responda el RPC.
+  const selection = useRef({ circle: selectedCircleAddr, viewer: activeAddress, version: 0 });
+  if (selection.current.circle !== selectedCircleAddr || selection.current.viewer !== activeAddress) {
+    selection.current = { circle: selectedCircleAddr, viewer: activeAddress, version: selection.current.version + 1 };
+  }
+  const circleDetail = loadedCircleDetail?.circleAddress === selectedCircleAddr &&
+    loadedCircleDetail.viewerAddress === activeAddress && loadedCircleDetail.selectionVersion === selection.current.version
+    ? loadedCircleDetail : null;
+  const nextFetchId = useRef(0);
+  const lastAppliedFetchId = useRef(0);
 
   const getWalletName = (addr: string) => {
     const found = DEMO_WALLETS.find((w) => w.address.toLowerCase() === addr.toLowerCase());
@@ -205,9 +250,16 @@ export function App() {
   };
 
   const fetchAllData = useCallback(async () => {
+    const selectionVersion = selection.current.version;
+    const fetchId = ++nextFetchId.current;
+    const isCurrent = () => selection.current.version === selectionVersion &&
+      selection.current.circle === selectedCircleAddr && selection.current.viewer === activeAddress &&
+      fetchId >= lastAppliedFetchId.current;
     try {
       await publicClient.getChainId();
+      if (!isCurrent()) return;
       setRpcConnected(true);
+      const blockNumber = await publicClient.getBlockNumber({ cacheTime: 0 });
 
       // 1. Balance y Reputación del usuario activo
       const [bal, repScore, repStats] = await Promise.all([
@@ -216,21 +268,25 @@ export function App() {
           abi: STABLECOIN_ABI,
           functionName: 'balanceOf',
           args: [activeAddress],
+          blockNumber,
         }),
         publicClient.readContract({
           address: DEFAULT_ADDRESSES.reputation,
           abi: REPUTATION_ABI,
           functionName: 'getReputationScore',
           args: [activeAddress],
+          blockNumber,
         }),
         publicClient.readContract({
           address: DEFAULT_ADDRESSES.reputation,
           abi: REPUTATION_ABI,
           functionName: 'getUserStats',
           args: [activeAddress],
+          blockNumber,
         }),
       ]);
 
+      if (!isCurrent()) return;
       setUserBalance(bal);
       setUserRep({
         score: Number(repScore),
@@ -248,7 +304,9 @@ export function App() {
         address: DEFAULT_ADDRESSES.factory,
         abi: FACTORY_ABI,
         functionName: 'getAllCircleCards',
+        blockNumber,
       });
+      if (!isCurrent()) return;
 
       const formattedCards: CircleCardData[] = rawCards.map((c) => ({
         circleAddress: c.circleAddress,
@@ -277,6 +335,7 @@ export function App() {
 
       if (targetCircle && !selectedCircleAddr) {
         setSelectedCircleAddr(targetCircle);
+        return; // La nueva selección dispara su propia carga.
       }
 
       if (targetCircle) {
@@ -285,23 +344,28 @@ export function App() {
             address: targetCircle,
             abi: SAVINGS_CIRCLE_ABI,
             functionName: 'getCircleOverview',
+            blockNumber,
           }),
           publicClient.readContract({
             address: targetCircle,
             abi: SAVINGS_CIRCLE_ABI,
             functionName: 'getAllParticipantsInfo',
+            blockNumber,
           }),
           publicClient.readContract({
             address: targetCircle,
             abi: SAVINGS_CIRCLE_ABI,
             functionName: 'getTurnOrder',
+            blockNumber,
           }),
           publicClient.readContract({
             address: targetCircle,
             abi: SAVINGS_CIRCLE_ABI,
             functionName: 'getAllRoundSummaries',
+            blockNumber,
           }),
         ]);
+        if (!isCurrent()) return;
 
         const currentRoundNum = overview[2];
         let statuses: readonly number[] = [];
@@ -311,6 +375,7 @@ export function App() {
             abi: SAVINGS_CIRCLE_ABI,
             functionName: 'getRoundStatuses',
             args: [currentRoundNum],
+            blockNumber,
           });
         }
 
@@ -323,13 +388,21 @@ export function App() {
               abi: REPUTATION_ABI,
               functionName: 'getReputationScore',
               args: [p.account],
+              blockNumber,
             });
             scoresMap[p.account.toLowerCase()] = Number(sc);
           })
         );
+        const draw = await publicClient.readContract({
+          address: targetCircle, abi: SAVINGS_CIRCLE_ABI, functionName: 'getDrawDetails', blockNumber,
+        });
+        if (!isCurrent()) return;
+        lastAppliedFetchId.current = fetchId;
         setMemberScores(scoresMap);
-
         setCircleDetail({
+          circleAddress: targetCircle,
+          viewerAddress: activeAddress,
+          selectionVersion,
           params: {
             name: overview[0].name,
             contributionAmount: overview[0].contributionAmount,
@@ -354,11 +427,15 @@ export function App() {
           turnOrder: [...turnOrder],
           roundStatuses: statuses.map((s) => Number(s)),
           roundSummaries: roundSummaries.map((r) => ({ ...r })),
+          draw: { provider: draw[0], demo: draw[1], requestId: draw[2], commitment: draw[3],
+            fulfilled: draw[4], word: draw[5], deadline: draw[6] },
         });
       }
     } catch (err) {
+      if (!isCurrent()) return;
       console.error('Error conectando a Anvil:', err);
       setRpcConnected(false);
+      setCircleDetail(null);
     }
   }, [activeAddress, selectedCircleAddr]);
 
@@ -383,11 +460,11 @@ export function App() {
         functionName: 'faucet',
         args: [activeAddress, parseEther('1000')],
       });
-      await publicClient.waitForTransactionReceipt({ hash });
+      await waitForSuccessfulTransaction(hash);
       notify('success', '¡+1,000 cUSD acreditados en tu billetera!');
       await fetchAllData();
     } catch (e: unknown) {
-      notify('error', `Error en Faucet: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `Error en Faucet: ${errorMessage(e)}`);
     } finally {
       setLoading(false);
     }
@@ -403,7 +480,7 @@ export function App() {
       const params = {
         name: newCircleForm.name,
         contributionAmount: parseEther(newCircleForm.contributionAmount || '100'),
-        collateralAmount: parseEther(newCircleForm.collateralAmount || '150'),
+        collateralAmount: parseEther(newCircleForm.collateralAmount || '330'),
         maxParticipants: BigInt(newCircleForm.maxParticipants || '3'),
         roundDuration: BigInt(Math.round(Number(newCircleForm.roundDurationDays || '7') * 86400)),
         gracePeriod: BigInt(Math.round(Number(newCircleForm.gracePeriodDays || '3') * 86400)),
@@ -411,6 +488,11 @@ export function App() {
         yieldRateBps: BigInt(Math.round(Number(newCircleForm.yieldRatePercent || '2') * 100)),
         payoutMode: Number(newCircleForm.payoutMode),
       };
+      const minimumCollateral = params.maxParticipants *
+        (params.contributionAmount + params.contributionAmount * params.latePenaltyBps / 10_000n);
+      if (params.collateralAmount < minimumCollateral) {
+        throw new Error(`La garantía mínima para cubrir el ciclo completo es ${formatEther(minimumCollateral)} cUSD.`);
+      }
 
       const hash = await wallet.writeContract({
         address: DEFAULT_ADDRESSES.factory,
@@ -418,7 +500,7 @@ export function App() {
         functionName: 'createCircle',
         args: [params],
       });
-      await publicClient.waitForTransactionReceipt({ hash });
+      await waitForSuccessfulTransaction(hash);
 
       setShowCreateModal(false);
       notify('success', `¡Círculo "${newCircleForm.name}" creado e inscrito en la bóveda!`);
@@ -433,7 +515,7 @@ export function App() {
         setSelectedCircleAddr(updatedCircles[updatedCircles.length - 1]);
       }
     } catch (e: unknown) {
-      notify('error', `Error al crear círculo: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `Error al crear círculo: ${errorMessage(e)}`);
     } finally {
       setLoading(false);
     }
@@ -452,19 +534,19 @@ export function App() {
         functionName: 'approve',
         args: [selectedCircleAddr, parseEther('100000')],
       });
-      await publicClient.waitForTransactionReceipt({ hash: approveHash });
+      await waitForSuccessfulTransaction(approveHash);
 
       const joinHash = await wallet.writeContract({
         address: selectedCircleAddr,
         abi: SAVINGS_CIRCLE_ABI,
         functionName: 'joinCircle',
       });
-      await publicClient.waitForTransactionReceipt({ hash: joinHash });
+      await waitForSuccessfulTransaction(joinHash);
 
       notify('success', '¡Inscripción exitosa! Garantía depositada en el MockYieldVault.');
       await fetchAllData();
     } catch (e: unknown) {
-      notify('error', `Error al unirse: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `Error al unirse: ${errorMessage(e)}`);
     } finally {
       setLoading(false);
     }
@@ -475,7 +557,7 @@ export function App() {
     if (!selectedCircleAddr || !circleDetail) return;
     try {
       setLoading(true);
-      notify('info', 'Inscribiendo participantes restantes y ejecutando Sorteo Verificable Fisher-Yates...');
+      notify('info', 'Inscribiendo participantes. El sorteo esperará una respuesta de aleatoriedad separada...');
 
       const joinedSet = new Set(circleDetail.participants.map((p) => p.account.toLowerCase()));
       const needed = Number(circleDetail.params.maxParticipants) - circleDetail.participants.length;
@@ -495,22 +577,24 @@ export function App() {
             functionName: 'approve',
             args: [selectedCircleAddr, parseEther('100000')],
           });
-          await publicClient.waitForTransactionReceipt({ hash: appHash });
+          await waitForSuccessfulTransaction(appHash);
 
           const jHash = await wClient.writeContract({
             address: selectedCircleAddr,
             abi: SAVINGS_CIRCLE_ABI,
             functionName: 'joinCircle',
           });
-          await publicClient.waitForTransactionReceipt({ hash: jHash });
+          await waitForSuccessfulTransaction(jHash);
           added++;
         }
       }
 
-      notify('success', '¡Cupo completado! Sorteo algorítmico verificable ejecutado y Ronda #1 iniciada.');
+      notify('success', added === needed
+        ? '¡Cupo completado! Lista cerrada; solicitud de aleatoriedad registrada.'
+        : `Se inscribieron ${added} participantes de demo; faltan ${needed - added} cupos.`);
       await fetchAllData();
     } catch (e: unknown) {
-      notify('error', `Error al autocompletar cupos: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `Error al autocompletar cupos: ${errorMessage(e)}`);
     } finally {
       setLoading(false);
     }
@@ -520,8 +604,11 @@ export function App() {
     if (!selectedCircleAddr || !circleDetail) return;
     try {
       setLoading(true);
+      await ensureRoundAcceptsPayments(selectedCircleAddr, circleDetail.currentRound);
       notify('info', `Pagando cuota de la Ronda #${circleDetail.currentRound.toString()}...`);
       const wallet = await getActiveWalletClient();
+      const maximumPayment = circleDetail.params.contributionAmount +
+        circleDetail.params.contributionAmount * circleDetail.params.latePenaltyBps / 10_000n;
 
       const allowance = await publicClient.readContract({
         address: DEFAULT_ADDRESSES.stablecoin,
@@ -530,67 +617,90 @@ export function App() {
         args: [activeAddress, selectedCircleAddr],
       });
 
-      if (allowance < parseEther('10000')) {
+      if (allowance < maximumPayment) {
         const appHash = await wallet.writeContract({
           address: DEFAULT_ADDRESSES.stablecoin,
           abi: STABLECOIN_ABI,
           functionName: 'approve',
-          args: [selectedCircleAddr, parseEther('100000')],
+          args: [selectedCircleAddr, maximumPayment],
         });
-        await publicClient.waitForTransactionReceipt({ hash: appHash });
+        await waitForSuccessfulTransaction(appHash);
       }
 
+      await ensureRoundAcceptsPayments(selectedCircleAddr, circleDetail.currentRound);
       const payHash = await wallet.writeContract({
         address: selectedCircleAddr,
         abi: SAVINGS_CIRCLE_ABI,
         functionName: 'payContribution',
       });
-      await publicClient.waitForTransactionReceipt({ hash: payHash });
+      await waitForSuccessfulTransaction(payHash);
 
       notify('success', `¡Aporte de la Ronda #${circleDetail.currentRound.toString()} registrado en la bóveda!`);
-      await fetchAllData();
     } catch (e: unknown) {
-      notify('error', `Error al pagar cuota: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `Error al pagar cuota: ${errorMessage(e)}`);
     } finally {
+      await fetchAllData();
       setLoading(false);
     }
   };
 
-  // Botón de ayuda para Demo: Hace que todos los participantes pendientes paguen su cuota de la ronda actual
+  // Solo controla las cuentas locales del selector; las billeteras externas pagan individualmente.
   const handleQuickPayAllPending = async () => {
     if (!selectedCircleAddr || !circleDetail) return;
+    let paid = 0;
     try {
       setLoading(true);
-      notify('info', 'Procesando el aporte de todos los participantes pendientes en esta ronda...');
+      await ensureRoundAcceptsPayments(selectedCircleAddr, circleDetail.currentRound);
+      notify('info', 'Procesando los aportes pendientes de las cuentas de demo...');
+      const statuses = await publicClient.readContract({ address: selectedCircleAddr,
+        abi: SAVINGS_CIRCLE_ABI, functionName: 'getRoundStatuses', args: [circleDetail.currentRound] });
+      const maximumPayment = circleDetail.params.contributionAmount +
+        circleDetail.params.contributionAmount * circleDetail.params.latePenaltyBps / 10_000n;
 
       for (let i = 0; i < circleDetail.participants.length; i++) {
         const p = circleDetail.participants[i];
-        const status = circleDetail.roundStatuses[i];
+        const status = statuses[i];
         if (status === 0) {
           const demoW = DEMO_WALLETS.find(
             (w) => w.address.toLowerCase() === p.account.toLowerCase()
           );
           if (demoW) {
+            await ensureRoundAcceptsPayments(selectedCircleAddr, circleDetail.currentRound);
             const wClient = createWalletClient({
               account: privateKeyToAccount(demoW.privateKey),
               chain: foundry,
               transport: http(ANVIL_RPC_URL),
             });
+            const allowance = await publicClient.readContract({ address: DEFAULT_ADDRESSES.stablecoin,
+              abi: STABLECOIN_ABI, functionName: 'allowance', args: [demoW.address, selectedCircleAddr] });
+            if (allowance < maximumPayment) {
+              const approveHash = await wClient.writeContract({ address: DEFAULT_ADDRESSES.stablecoin,
+                abi: STABLECOIN_ABI, functionName: 'approve', args: [selectedCircleAddr, maximumPayment] });
+              await waitForSuccessfulTransaction(approveHash);
+            }
+            await ensureRoundAcceptsPayments(selectedCircleAddr, circleDetail.currentRound);
             const payHash = await wClient.writeContract({
               address: selectedCircleAddr,
               abi: SAVINGS_CIRCLE_ABI,
               functionName: 'payContribution',
             });
-            await publicClient.waitForTransactionReceipt({ hash: payHash });
+            await waitForSuccessfulTransaction(payHash);
+            paid++;
           }
         }
       }
 
-      notify('success', '¡Todos los participantes de la ronda han pagado! Lista para desembolsar.');
-      await fetchAllData();
+      const updatedStatuses = await publicClient.readContract({ address: selectedCircleAddr,
+        abi: SAVINGS_CIRCLE_ABI, functionName: 'getRoundStatuses', args: [circleDetail.currentRound] });
+      const pending = updatedStatuses.filter(status => status === 0).length;
+      const confirmation = paid === 1 ? 'Se confirmó 1 aporte de demo.' : `Se confirmaron ${paid} aportes de demo.`;
+      notify(pending === 0 ? 'success' : 'info', pending === 0
+        ? `${confirmation} Todos los pagos de la ronda están completos.`
+        : `${confirmation} ${pending === 1 ? 'Queda 1 participante pendiente' : `Quedan ${pending} participantes pendientes`}; las billeteras externas deben pagar individualmente.`);
     } catch (e: unknown) {
-      notify('error', `Error en pago grupal: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `Pago grupal interrumpido tras ${paid} aportes confirmados: ${errorMessage(e)}`);
     } finally {
+      await fetchAllData();
       setLoading(false);
     }
   };
@@ -607,18 +717,18 @@ export function App() {
         abi: SAVINGS_CIRCLE_ABI,
         functionName: 'settleCurrentRound',
       });
-      await publicClient.waitForTransactionReceipt({ hash });
+      await waitForSuccessfulTransaction(hash);
 
       const isLastRound = circleDetail.currentRound === circleDetail.params.maxParticipants;
       notify(
         'success',
         isLastRound
-          ? '¡Ciclo finalizado! Garantías, ahorros, rendimientos y multas repartidos automáticamente a los puntuales.'
-          : `¡Ronda #${circleDetail.currentRound.toString()} liquidada y desembolso ejecutado!`
+          ? '¡Ciclo finalizado! Garantías y capital devueltos; premios repartidos según los puntos de puntualidad o por igual si nadie tiene puntos.'
+          : `¡Ronda #${circleDetail.currentRound.toString()} liquidada! ${circleDetail.params.payoutMode === 0 ? 'Pozo desembolsado.' : 'Aportes acumulados para el cierre.'}`
       );
       await fetchAllData();
     } catch (e: unknown) {
-      notify('error', `Error al liquidar ronda: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `Error al liquidar ronda: ${errorMessage(e)}`);
     } finally {
       setLoading(false);
     }
@@ -629,23 +739,63 @@ export function App() {
     try {
       setLoading(true);
       notify('info', `Simulando avance de tiempo: ${label}...`);
-      const wallet = await getActiveWalletClient();
-
-      const hash = await wallet.writeContract({
-        address: selectedCircleAddr,
-        abi: SAVINGS_CIRCLE_ABI,
-        functionName: 'advanceVirtualTime',
-        args: [seconds],
-      });
-      await publicClient.waitForTransactionReceipt({ hash });
-
-      notify('success', `Reloj del contrato avanzado (${label}).`);
+      if (await publicClient.getChainId() !== 31337) throw new Error('El avance de tiempo solo está disponible en Anvil local.');
+      const localNode = createTestClient({ mode: 'anvil', chain: foundry, transport: http(ANVIL_RPC_URL) });
+      await localNode.increaseTime({ seconds: Number(seconds) });
+      await localNode.mine({ blocks: 1 });
+      notify('success', `Tiempo del nodo local avanzado (${label}).`);
       await fetchAllData();
     } catch (e: unknown) {
-      notify('error', `Error al avanzar tiempo: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `Error al avanzar tiempo: ${errorMessage(e)}`);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleFinalizeDraw = async () => {
+    if (!selectedCircleAddr || !circleDetail) return;
+    try {
+      setLoading(true);
+      const wallet = await getActiveWalletClient();
+      if (circleDetail.draw.demo && !circleDetail.draw.fulfilled) {
+        if (await publicClient.getChainId() !== 31337) throw new Error('Proveedor simulado permitido solo en Anvil.');
+        const bytes = crypto.getRandomValues(new Uint8Array(32));
+        const word = BigInt(`0x${Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')}`);
+        const response = await wallet.writeContract({ address: circleDetail.draw.provider,
+          abi: RANDOMNESS_ABI, functionName: 'fulfill', args: [circleDetail.draw.requestId, word] });
+        await waitForSuccessfulTransaction(response);
+      }
+      const hash = await wallet.writeContract({ address: selectedCircleAddr,
+        abi: SAVINGS_CIRCLE_ABI, functionName: 'finalizeDraw' });
+      await waitForSuccessfulTransaction(hash);
+      notify('success', 'Orden fijado una sola vez. Ronda #1 iniciada.');
+      await fetchAllData();
+    } catch (e) { notify('error', `No se pudo finalizar: ${(e as Error).message}`); }
+    finally { setLoading(false); }
+  };
+
+  const handleCancelOrRefund = async (refund: boolean) => {
+    if (!selectedCircleAddr) return;
+    try {
+      setLoading(true);
+      const wallet = await getActiveWalletClient();
+      const hash = await wallet.writeContract({ address: selectedCircleAddr, abi: SAVINGS_CIRCLE_ABI,
+        functionName: refund ? 'claimCancelledCollateral' : 'cancelUnfilledCircle' });
+      await waitForSuccessfulTransaction(hash);
+      notify('success', refund ? 'Garantía devuelta.' : 'Inscripción vencida cancelada; cada miembro puede recuperar su garantía.');
+      await fetchAllData();
+    } catch (e) { notify('error', (e as Error).message); }
+    finally { setLoading(false); }
+  };
+
+  const handleVerifyDraw = () => {
+    if (!selectedCircleAddr || !circleDetail) return;
+    const d = circleDetail;
+    const valid = verifyDraw(BigInt(foundry.id), selectedCircleAddr, d.params, d.participants.map(p => p.account),
+      d.draw.commitment, d.draw.requestId, d.draw.word, d.verifiableSeed, d.turnOrder);
+    notify(valid ? 'success' : 'error', valid
+      ? `Compromiso, semilla y orden coinciden con el cálculo independiente.${d.draw.demo ? ' La fuente es simulada, sin prueba VRF.' : ' Revisar también la entrega del coordinador VRF.'}`
+      : 'La evidencia del sorteo no coincide con el cálculo independiente.');
   };
 
   const handleVouch = async (candidateAddress: `0x${string}`) => {
@@ -660,12 +810,12 @@ export function App() {
         functionName: 'vouchForMember',
         args: [candidateAddress],
       });
-      await publicClient.waitForTransactionReceipt({ hash });
+      await waitForSuccessfulTransaction(hash);
 
       notify('success', `¡Aval social registrado! El puntaje crediticio de ${getWalletName(candidateAddress)} subió +15 pts.`);
       await fetchAllData();
     } catch (e: unknown) {
-      notify('error', `No se pudo avalar: ${(e as Error).shortMessage || (e as Error).message}`);
+      notify('error', `No se pudo avalar: ${errorMessage(e)}`);
     } finally {
       setLoading(false);
     }
@@ -721,6 +871,11 @@ export function App() {
     circleDetail && currentRoundSummary
       ? currentRoundSummary.paidCount === circleDetail.params.maxParticipants
       : false;
+
+  const pendingDemoParticipantsCount = circleDetail
+    ? circleDetail.participants.filter((p, i) => circleDetail.roundStatuses[i] === 0 &&
+      DEMO_WALLETS.some(w => w.address.toLowerCase() === p.account.toLowerCase())).length
+    : 0;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
@@ -926,7 +1081,7 @@ export function App() {
                               : 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/30'
                           }`}
                         >
-                          {c.state === 0 ? 'Abierta' : c.state === 1 ? `Ronda ${c.currentRound.toString()}/${c.maxParticipants.toString()}` : 'Finalizada'}
+                          {c.state === 0 ? 'Abierta' : c.state === 1 ? `Ronda ${c.currentRound.toString()}/${c.maxParticipants.toString()}` : c.state === 3 ? 'Sorteo pendiente' : c.state === 4 ? 'Cancelada' : 'Finalizada'}
                         </span>
                       </div>
 
@@ -1033,7 +1188,16 @@ export function App() {
         <div className="lg:col-span-8 space-y-6">
           {!circleDetail ? (
             <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-12 text-center">
-              <p className="text-slate-400">Selecciona o crea un círculo de ahorro para ver su bóveda inteligente.</p>
+              <p className="text-slate-400" role="status">
+                {selectedCircleAddr
+                  ? rpcConnected ? 'Cargando datos del círculo seleccionado…' : 'No se pudieron cargar los datos. Comprueba el nodo y reintenta.'
+                  : 'Selecciona o crea un círculo de ahorro para ver su bóveda inteligente.'}
+              </p>
+              {selectedCircleAddr && !rpcConnected && (
+                <button onClick={fetchAllData} className="mt-3 px-3 py-2 rounded-lg bg-indigo-600 text-white text-xs">
+                  Reintentar carga
+                </button>
+              )}
             </div>
           ) : (
             <>
@@ -1050,7 +1214,7 @@ export function App() {
                       </span>
                     </div>
                     <p className="text-xs text-slate-400 font-mono">
-                      Contrato Bóveda Inmutable: {selectedCircleAddr}
+                      Contrato Bóveda Inmutable: {circleDetail.circleAddress}
                     </p>
                   </div>
 
@@ -1068,6 +1232,8 @@ export function App() {
                         ? '1. Inscripción Abierta'
                         : circleDetail.state === 1
                         ? `2. En Curso — Ronda #${circleDetail.currentRound.toString()} de ${circleDetail.params.maxParticipants.toString()}`
+                        : circleDetail.state === 3 ? 'Esperando sorteo'
+                        : circleDetail.state === 4 ? 'Cancelada — Garantías reembolsables'
                         : '3. Ciclo Completado y Liquidado'}
                     </span>
                   </div>
@@ -1141,8 +1307,8 @@ export function App() {
                         <strong className="text-slate-200">
                           {formatEther(circleDetail.params.collateralAmount)} cUSD
                         </strong>{' '}
-                        de garantía reembolsable. Cuando se complete el cupo, el contrato ejecutará el{' '}
-                        <strong className="text-emerald-300">Sorteo Algorítmico Verificable</strong> automáticamente.
+                        de garantía reembolsable. Al completar el cupo se cierra la lista y se solicita{' '}
+                        <strong className="text-emerald-300">aleatoriedad en una transacción separada</strong>.
                       </p>
                     </div>
 
@@ -1150,7 +1316,7 @@ export function App() {
                       {!activeUserJoined ? (
                         <button
                           onClick={handleJoinCircle}
-                          disabled={loading}
+                          disabled={loading || circleDetail.currentTime >= circleDetail.draw.deadline}
                           className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold flex items-center gap-2 shadow-lg shadow-emerald-950/50 transition"
                         >
                           <UserCheck className="w-4 h-4" />
@@ -1165,14 +1331,38 @@ export function App() {
 
                       <button
                         onClick={handleQuickFillParticipants}
-                        disabled={loading}
+                        disabled={loading || circleDetail.currentTime >= circleDetail.draw.deadline}
                         className="px-3.5 py-2.5 rounded-xl bg-indigo-600/25 hover:bg-indigo-600/40 border border-indigo-500/40 text-indigo-200 text-xs font-semibold flex items-center gap-1.5 transition"
-                        title="Inscribe automáticamente a las cuentas de demostración restantes para iniciar el sorteo de inmediato"
+                        title="Completa las inscripciones con cuentas de Anvil; el sorteo se finaliza por separado"
                       >
                         <Shuffle className="w-4 h-4 text-indigo-400" />
-                        Autocompletar Cupos & Sortear Turnos (1-Click Demo)
+                        Autocompletar Cupos (Demo)
                       </button>
                     </div>
+                  </div>
+                )}
+
+                {circleDetail.state === 0 && circleDetail.currentTime >= circleDetail.draw.deadline && (
+                  <button onClick={() => handleCancelOrRefund(false)} disabled={loading} className="px-4 py-2 text-amber-300 border rounded-xl">
+                    Cancelar inscripción vencida y habilitar devoluciones
+                  </button>
+                )}
+                {circleDetail.state === 4 && activeUserJoined && (
+                  <button onClick={() => handleCancelOrRefund(true)} disabled={loading || circleDetail.participants.find(p => p.account.toLowerCase() === activeAddress.toLowerCase())?.collateralBalance === 0n} className="px-4 py-2 text-emerald-300 border rounded-xl">
+                    Recuperar mi garantía
+                  </button>
+                )}
+                {circleDetail.state === 3 && (
+                  <div className="border border-amber-500/40 rounded-xl p-4 space-y-3">
+                    <h3 className="font-bold text-white">Inscripciones cerradas · Sorteo pendiente</h3>
+                    <p className="text-sm text-slate-300">{circleDetail.draw.demo
+                      ? 'Demo local sin proveedor externo: la respuesta se simula y quien la envía puede escogerla. Se verifica el cálculo del orden; no se garantiza imparcialidad de la fuente.'
+                      : 'Esperando la respuesta del coordinador VRF. Los participantes y las reglas ya están fijados.'}</p>
+                    <p className="text-xs font-mono break-all text-slate-400">Solicitud: {circleDetail.draw.requestId.toString()} · Compromiso: {circleDetail.draw.commitment}</p>
+                    <button onClick={handleFinalizeDraw} disabled={loading || (!circleDetail.draw.demo && !circleDetail.draw.fulfilled)}
+                      className="px-4 py-2 rounded-xl bg-emerald-600 disabled:opacity-50 text-white">
+                      {circleDetail.draw.demo && !circleDetail.draw.fulfilled ? 'Simular respuesta y finalizar (Demo)' : 'Finalizar sorteo recibido'}
+                    </button>
                   </div>
                 )}
 
@@ -1241,15 +1431,17 @@ export function App() {
                           {activeUserJoined && activeUserRoundStatus === 0 ? (
                             <button
                               onClick={handlePayContribution}
-                              disabled={loading}
-                              className={`px-4 py-2 rounded-xl text-white text-xs font-bold flex items-center gap-2 shadow-lg transition ${
+                              disabled={loading || isRoundExpired}
+                              className={`px-4 py-2 rounded-xl text-white text-xs font-bold flex items-center gap-2 shadow-lg transition disabled:opacity-40 ${
                                 isGraceWindow
                                   ? 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-950/50'
                                   : 'bg-amber-600 hover:bg-amber-500 shadow-amber-950/50'
                               }`}
                             >
                               <Coins className="w-4 h-4" />
-                              {isGraceWindow
+                              {isRoundExpired
+                                ? 'Plazo vencido · Liquidar ronda'
+                                : isGraceWindow
                                 ? `Pagar Cuota Puntual con ${getWalletName(activeAddress).split(' ')[0]} (${formatEther(circleDetail.params.contributionAmount)} cUSD)`
                                 : `Pagar en Mora con ${getWalletName(activeAddress).split(' ')[0]} (${formatEther(
                                     circleDetail.params.contributionAmount +
@@ -1272,12 +1464,12 @@ export function App() {
                           {!allPaidInCurrentRound && (
                             <button
                               onClick={handleQuickPayAllPending}
-                              disabled={loading}
-                              className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition"
-                              title="Hace que todos los participantes que faltan por pagar en la ronda actual aporten su cuota"
+                              disabled={loading || isRoundExpired || pendingDemoParticipantsCount === 0}
+                              className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition disabled:opacity-40"
+                              title="Paga solo con las cuentas locales del selector. Las billeteras externas pagan individualmente."
                             >
                               <Users className="w-3.5 h-3.5 text-emerald-400" />
-                              Pagar con Todos los Restantes (1-Click)
+                              Pagar pendientes de demo ({pendingDemoParticipantsCount})
                             </button>
                           )}
                         </div>
@@ -1302,7 +1494,7 @@ export function App() {
                       <div className="flex items-center gap-2 text-xs text-indigo-200">
                         <FastForward className="w-4 h-4 text-indigo-400 shrink-0" />
                         <span>
-                          <strong>Laboratorio de Tiempo (Sustentación):</strong> Avanza el reloj del contrato para probar multas por mora o cobertura automática de impagos con la garantía.
+                          <strong>Laboratorio de Tiempo (Sustentación):</strong> Avanza el tiempo del nodo Anvil local para probar mora o cobertura de impagos; los contratos usan el tiempo del bloque.
                         </span>
                       </div>
 
@@ -1353,7 +1545,10 @@ export function App() {
                             )}{' '}
                             cUSD
                           </strong>{' '}
-                          (Rendimiento Base + Multas) entre los participantes puntuales.
+                          (Rendimiento Base + Multas){' '}
+                          {circleDetail.totalOnTimeShares > 0n
+                            ? 'según los puntos acumulados por pagos puntuales.'
+                            : 'por igual entre los participantes, porque nadie acumuló puntos de puntualidad.'}
                         </p>
                       </div>
                     </div>
@@ -1368,28 +1563,48 @@ export function App() {
                     <div>
                       <h3 className="text-base font-bold text-white flex items-center gap-2">
                         <Shuffle className="w-4 h-4 text-emerald-400" />
-                        Sorteo Algorítmico Verificable (Orden de Turnos)
+                        Sorteo Algorítmico Verificable ({circleDetail.params.payoutMode === 0 ? 'Orden de Turnos' : 'Orden de Referencia'})
                       </h3>
                       <p className="text-xs text-slate-400">
-                        Secuencia generada on-chain mediante barajado determinístico Fisher-Yates al completarse el cupo
+                        Fisher-Yates con muestreo por rechazo; inscripciones cerradas antes de recibir la aleatoriedad
+                        {circleDetail.params.payoutMode === 1 && '. En la natillera todos reciben su liquidación al cierre del ciclo.'}
                       </p>
+                      {circleDetail.draw.demo && (
+                        <p className="mt-1 text-xs text-amber-300">
+                          Fuente simulada sin proveedor externo: el cálculo es verificable, pero quien envía la respuesta puede escogerla.
+                        </p>
+                      )}
                     </div>
                     <div className="text-[11px] font-mono bg-slate-950 border border-slate-800 px-3 py-1 rounded-lg text-slate-400">
-                      Semilla: {circleDetail.verifiableSeed.slice(0, 18)}...
-                      {circleDetail.verifiableSeed.slice(-10)}
+                      {circleDetail.draw.demo ? 'Fuente simulada · Demo local' : 'Fuente: proveedor VRF'}
                     </div>
                   </div>
+
+                  <details className="mb-4 text-xs text-slate-400">
+                    <summary className="cursor-pointer">Evidencia completa del sorteo</summary>
+                    <div className="space-y-2 mt-3 font-mono break-all">
+                      <p>Proveedor: {circleDetail.draw.provider}</p>
+                      <p>Solicitud: {circleDetail.draw.requestId.toString()}</p>
+                      <p>Compromiso: {circleDetail.draw.commitment}</p>
+                      <p>Salida de la fuente: {circleDetail.draw.word.toString()}</p>
+                      <p>Semilla: {circleDetail.verifiableSeed}</p>
+                    </div>
+                    <button onClick={handleVerifyDraw} className="mt-3 px-3 py-2 rounded-lg bg-indigo-600 text-white">
+                      Verificar compromiso, semilla y orden
+                    </button>
+                  </details>
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 md:grid-cols-5 gap-3">
                     {circleDetail.turnOrder.map((addr, idx) => {
                       const turnNum = idx + 1;
+                      const member = circleDetail.participants.find(p => p.account.toLowerCase() === addr.toLowerCase());
+                      const isRosca = circleDetail.params.payoutMode === 0;
                       const isCurrentTurn =
-                        circleDetail.state === 1 &&
+                        isRosca && circleDetail.state === 1 &&
                         Number(circleDetail.currentRound) === turnNum;
-                      const isPastTurn =
-                        circleDetail.state === 2 ||
-                        (circleDetail.state === 1 &&
-                          Number(circleDetail.currentRound) > turnNum);
+                      const isPaid = isRosca
+                        ? (member?.turnPayoutReceived ?? 0n) > 0n
+                        : circleDetail.state === 2 && (member?.totalReceivedAtClose ?? 0n) > 0n;
 
                       return (
                         <div
@@ -1397,17 +1612,20 @@ export function App() {
                           className={`p-3.5 rounded-xl border relative ${
                             isCurrentTurn
                               ? 'bg-emerald-950/40 border-emerald-500/60 shadow-md'
-                              : isPastTurn
+                              : isPaid
                               ? 'bg-slate-950/70 border-slate-800 opacity-85'
                               : 'bg-slate-950/40 border-slate-800/70'
                           }`}
                         >
                           <div className="flex items-center justify-between text-xs mb-1.5">
-                            <span className="font-bold text-emerald-400">Turno #{turnNum}</span>
-                            {isPastTurn && (
+                            <span className="font-bold text-emerald-400">{isRosca ? 'Turno' : 'Posición'} #{turnNum}</span>
+                            {isPaid && (
                               <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
-                                Cobrado
+                                {isRosca ? 'Cobrado' : 'Liquidado'}
                               </span>
+                            )}
+                            {!isRosca && !isPaid && (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300">Al cierre</span>
                             )}
                             {isCurrentTurn && (
                               <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 animate-pulse">
@@ -1439,6 +1657,9 @@ export function App() {
                     <p className="text-xs text-slate-400">
                       Transparencia contable en tiempo real: aportes, puntos de puntualidad (shares de rendimiento) y avales sociales
                     </p>
+                    <p className="mt-1 text-xs text-slate-400">
+                      Los premios se reparten según los puntos acumulados; si nadie tiene puntos, se reparten por igual.
+                    </p>
                   </div>
                 </div>
 
@@ -1447,7 +1668,7 @@ export function App() {
                     <thead>
                       <tr className="border-b border-slate-800 text-slate-400 uppercase tracking-wider text-[11px]">
                         <th className="py-3 px-3">Participante</th>
-                        <th className="py-3 px-3">Turno</th>
+                        <th className="py-3 px-3">{circleDetail.params.payoutMode === 0 ? 'Turno' : 'Orden sorteado'}</th>
                         <th className="py-3 px-3">Estado Ronda Actual</th>
                         <th className="py-3 px-3">Garantía Activa</th>
                         <th className="py-3 px-3">Ahorro Aportado</th>
@@ -1462,14 +1683,19 @@ export function App() {
                         const repScore = memberScores[p.account.toLowerCase()] ?? 500;
                         const isSelf = p.account.toLowerCase() === activeAddress.toLowerCase();
 
-                        // Calcular participación estimada del pozo de premios (Yield + Multas)
+                        const activeCollateral = circleDetail.state === 2 ? 0n : p.collateralBalance;
+                        // El contrato conserva el saldo histórico de garantía al completar el ciclo.
+                        const returnedPrincipal = p.collateralBalance +
+                          (circleDetail.params.payoutMode === 1 ? p.principalSaved : 0n);
                         const totalRewards =
                           circleDetail.totalYieldGenerated +
                           circleDetail.totalPenaltiesCollected;
                         const estimatedReward =
-                          circleDetail.totalOnTimeShares > 0n
+                          circleDetail.state === 2
+                            ? p.totalReceivedAtClose - returnedPrincipal
+                            : circleDetail.totalOnTimeShares > 0n
                             ? (totalRewards * p.onTimeShares) / circleDetail.totalOnTimeShares
-                            : 0n;
+                            : totalRewards / BigInt(circleDetail.participants.length);
 
                         return (
                           <tr key={p.account} className="hover:bg-slate-800/40 transition">
@@ -1498,6 +1724,8 @@ export function App() {
                               {circleDetail.state === 2 && (
                                 <span className="text-indigo-300 font-semibold">Ciclo cerrado</span>
                               )}
+                              {circleDetail.state === 3 && <span className="text-amber-300">Sorteo pendiente</span>}
+                              {circleDetail.state === 4 && <span className="text-slate-400">Círculo cancelado</span>}
                               {circleDetail.state === 1 && (
                                 <>
                                   {rStatus === 0 && (
@@ -1527,13 +1755,18 @@ export function App() {
                             <td className="py-3 px-3">
                               <span
                                 className={`font-semibold ${
-                                  p.collateralBalance < circleDetail.params.collateralAmount
+                                  circleDetail.state !== 2 && p.collateralBalance < circleDetail.params.collateralAmount
                                     ? 'text-rose-400'
                                     : 'text-slate-200'
                                 }`}
                               >
-                                {formatEther(p.collateralBalance)} cUSD
+                                {formatEther(activeCollateral)} cUSD
                               </span>
+                              {circleDetail.state === 2 && (
+                                <span className="block text-[10px] text-indigo-300">
+                                  Devuelta al cierre: {formatEther(p.collateralBalance)} cUSD
+                                </span>
+                              )}
                               {p.defaultsCount > 0n && (
                                 <span className="block text-[10px] text-rose-400">
                                   ({p.defaultsCount.toString()} default descontado)
@@ -1550,7 +1783,7 @@ export function App() {
                                 {p.onTimeShares.toString()} pts
                               </div>
                               <div className="text-[10px] text-amber-300">
-                                Premio acum: +{ Number(formatEther(estimatedReward)).toFixed(2) } cUSD
+                                {circleDetail.state === 2 ? 'Premio liquidado' : 'Premio estimado'}: +{ Number(formatEther(estimatedReward)).toFixed(2) } cUSD
                               </div>
                             </td>
 
@@ -1702,7 +1935,7 @@ export function App() {
                   >
                     <div className="font-bold text-white mb-0.5">🏦 Al Cierre (Natillera)</div>
                     <div className="text-[11px] opacity-80">
-                      Bloquea todos los aportes generando interés compuesto hasta cerrar el ciclo.
+                      Acumula los aportes y el rendimiento simulado hasta cerrar el ciclo.
                     </div>
                   </button>
                 </div>
@@ -1731,7 +1964,7 @@ export function App() {
                   </label>
                   <input
                     type="number"
-                    min={newCircleForm.contributionAmount}
+                    min={Number(newCircleForm.maxParticipants) * Number(newCircleForm.contributionAmount) * (1 + Number(newCircleForm.latePenaltyPercent) / 100)}
                     required
                     value={newCircleForm.collateralAmount}
                     onChange={(e) =>
@@ -1739,6 +1972,7 @@ export function App() {
                     }
                     className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-white"
                   />
+                  <p className="text-slate-400 mt-1">Debe cubrir las cuotas y multas de todo el ciclo.</p>
                 </div>
 
                 <div>

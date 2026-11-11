@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite --port 3000",
     "build": "vite build",
-    "preview": "vite preview --port 3000"
+    "preview": "vite preview --port 3000",
+    "typecheck": "tsc --noEmit",
+    "test:draw": "node --test scripts/draw.test.mjs",
+    "verify:draw": "node scripts/verify-draw.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

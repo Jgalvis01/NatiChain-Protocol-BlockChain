@@ -4,46 +4,49 @@ pragma solidity ^0.8.24;
 import {MockStablecoin} from "./MockStablecoin.sol";
 import {MockYieldVault} from "./MockYieldVault.sol";
 import {ReputationRegistry} from "./ReputationRegistry.sol";
+import {IRandomnessProvider} from "./IRandomnessProvider.sol";
 
 /**
  * @title SavingsCircle (Bóveda Inmutable de Ahorro Comunitario)
  * @notice Contrato inteligente que reemplaza al tesorero humano en Natilleras (ASCA) y Cadenas (ROSCA).
  *         Implementa:
- *         1. Bóveda inmutable sin riesgo de apropiación.
+ *         1. Custodia programada sin retiro arbitrario del tesorero.
  *         2. Reglas anti-mora (ventana de gracia, multas automáticas, cobertura con garantía y premio a puntuales).
- *         3. Sorteo verificable (Fisher-Yates con semilla criptográfica auditable).
+ *         3. Sorteo asíncrono con proveedor verificable (o mock explícito en Anvil).
  *         4. Generación de rendimiento base sobre el saldo bloqueado vía MockYieldVault.
  *         5. Desembolso automático por turnos (ROSCA) o al cierre del ciclo (ASCA).
  */
 contract SavingsCircle {
     enum PayoutMode {
         ROSCA, // 0: Por Turnos (Cadena / Pasanaku) - Desembolsa el pozo en cada ronda según orden sorteado
-        ASCA   // 1: Al Cierre del Ciclo (Natillera) - Acumula todo el capital + interés compuesto hasta el final
+        ASCA // 1: Al Cierre del Ciclo (Natillera) - Acumula capital y rendimiento simulado
     }
 
     enum CircleState {
-        OPEN,      // Esperando que se inscriban los N participantes
-        ACTIVE,    // En curso: rondas de ahorro y adjudicación activas
-        COMPLETED  // Ciclo finalizado y fondos/rendimientos liquidados
+        OPEN, // Esperando que se inscriban los N participantes
+        ACTIVE, // En curso: rondas de ahorro y adjudicación activas
+        COMPLETED, // Ciclo finalizado y fondos/rendimientos liquidados
+        DRAW_PENDING, // Inscripciones cerradas; esperando fuente externa o finalización
+        CANCELLED // Cupo no completado antes del plazo; garantías reclamables
     }
 
     enum PaymentStatus {
-        PENDING,         // Aún no ha pagado en la ronda
-        ON_TIME,         // Pagó puntualmente dentro de la ventana de gracia
-        LATE,            // Pagó en mora (con recargo/multa)
-        DEFAULT_COVERED  // Incumplió y su cuota fue cubierta automáticamente con su garantía
+        PENDING, // Aún no ha pagado en la ronda
+        ON_TIME, // Pagó puntualmente dentro de la ventana de gracia
+        LATE, // Pagó en mora (con recargo/multa)
+        DEFAULT_COVERED // Incumplió y su cuota fue cubierta automáticamente con su garantía
     }
 
     struct CircleParams {
         string name;
         uint256 contributionAmount; // Cuota periódica en cUSD (18 dec)
-        uint256 collateralAmount;   // Garantía inicial anti-fuga en cUSD
-        uint256 maxParticipants;    // Número de participantes (N) y de rondas
-        uint256 roundDuration;      // Duración de cada ronda en segundos
-        uint256 gracePeriod;        // Ventana de pago puntual sin multa (segundos desde inicio de ronda)
-        uint256 latePenaltyBps;     // Multa por pago en mora en puntos básicos (ej. 500 = 5%)
-        uint256 yieldRateBps;       // Rendimiento base simulado por ronda en puntos básicos (ej. 150 = 1.5%)
-        PayoutMode payoutMode;      // ROSCA (Por turnos) o ASCA (Al cierre del ciclo)
+        uint256 collateralAmount; // Garantía inicial anti-fuga en cUSD
+        uint256 maxParticipants; // Número de participantes (N) y de rondas
+        uint256 roundDuration; // Duración de cada ronda en segundos
+        uint256 gracePeriod; // Ventana de pago puntual sin multa (segundos desde inicio de ronda)
+        uint256 latePenaltyBps; // Multa por pago en mora en puntos básicos (ej. 500 = 5%)
+        uint256 yieldRateBps; // Rendimiento base simulado por ronda en puntos básicos (ej. 150 = 1.5%)
+        PayoutMode payoutMode; // ROSCA (Por turnos) o ASCA (Al cierre del ciclo)
     }
 
     struct ParticipantInfo {
@@ -75,6 +78,11 @@ contract SavingsCircle {
     MockYieldVault public immutable yieldVault;
     ReputationRegistry public immutable reputationRegistry;
     address public immutable creator;
+    IRandomnessProvider public immutable randomnessProvider;
+    uint256 public immutable registrationDeadline;
+    bytes32 public constant DRAW_VERSION = keccak256("NatiChain.Draw.v2");
+    uint256 public drawRequestId;
+    bytes32 public drawCommitment;
 
     CircleParams public params;
     CircleState public state;
@@ -85,7 +93,6 @@ contract SavingsCircle {
 
     uint256 public currentRound; // 1..maxParticipants
     uint256 public currentRoundStart;
-    uint256 public virtualTimeOffset; // Permite simular paso del tiempo en demos en vivo (incluso en testnets)
 
     uint256 public totalOnTimeShares;
     uint256 public totalPenaltiesCollected;
@@ -95,13 +102,27 @@ contract SavingsCircle {
     mapping(uint256 => mapping(address => PaymentStatus)) public roundPaymentStatus;
     mapping(uint256 => RoundSummary) public roundSummaries;
 
-    event ParticipantJoined(address indexed participant, uint256 currentCount, uint256 maxParticipants, uint256 collateralDeposited);
+    event ParticipantJoined(
+        address indexed participant, uint256 currentCount, uint256 maxParticipants, uint256 collateralDeposited
+    );
     event VerifiableDrawCompleted(address[] turnOrder, bytes32 seedUsed, uint256 startTime);
-    event ContributionPaid(address indexed participant, uint256 indexed round, PaymentStatus status, uint256 amountPaid, uint256 penaltyPaid);
-    event DefaultCoveredByCollateral(address indexed participant, uint256 indexed round, uint256 contributionCovered, uint256 penaltyCovered);
-    event RoundSettled(uint256 indexed round, address indexed beneficiary, uint256 potDisbursed, uint256 yieldGenerated);
+    event ContributionPaid(
+        address indexed participant,
+        uint256 indexed round,
+        PaymentStatus status,
+        uint256 amountPaid,
+        uint256 penaltyPaid
+    );
+    event DefaultCoveredByCollateral(
+        address indexed participant, uint256 indexed round, uint256 contributionCovered, uint256 penaltyCovered
+    );
+    event RoundSettled(
+        uint256 indexed round, address indexed beneficiary, uint256 potDisbursed, uint256 yieldGenerated
+    );
     event CycleCompleted(uint256 totalYieldDistributed, uint256 totalPenaltiesDistributed);
-    event VirtualTimeAdvanced(uint256 secondsAdded, uint256 newVirtualTimestamp);
+    event DrawRequested(uint256 indexed requestId, bytes32 commitment, bool demo);
+    event CircleCancelled();
+    event CollateralRefunded(address indexed participant, uint256 amount);
 
     error CircleNotOpen();
     error CircleNotActive();
@@ -111,30 +132,40 @@ contract SavingsCircle {
     error InvalidParameters();
     error RoundNotReadyToSettle();
     error InsufficientCollateralToJoin();
+    error DrawNotPending();
+    error RandomnessNotReady();
+    error RegistrationClosed();
+    error CannotCancel();
+    error NoRefundAvailable();
+    error RoundExpired();
 
     constructor(
         address _stablecoin,
         address _yieldVault,
         address _reputationRegistry,
         address _creator,
+        address _randomnessProvider,
         CircleParams memory _params
     ) {
         if (
-            _params.maxParticipants < 2 ||
-            _params.maxParticipants > 50 ||
-            _params.contributionAmount == 0 ||
-            _params.roundDuration == 0 ||
-            _params.gracePeriod == 0 ||
-            _params.gracePeriod > _params.roundDuration ||
-            _params.collateralAmount < _params.contributionAmount
+            _params.maxParticipants < 2 || _params.maxParticipants > 50 || _params.contributionAmount == 0
+                || _params.roundDuration == 0 || _params.gracePeriod == 0 || _params.gracePeriod > _params.roundDuration
+                || _params.latePenaltyBps > 10_000 || _params.yieldRateBps > 10_000
+                || _randomnessProvider.code.length == 0
         ) {
             revert InvalidParameters();
+        }
+        uint256 penalty = (_params.contributionAmount * _params.latePenaltyBps) / 10_000;
+        if (_params.collateralAmount < _params.maxParticipants * (_params.contributionAmount + penalty)) {
+            revert InsufficientCollateralToJoin();
         }
 
         stablecoin = MockStablecoin(_stablecoin);
         yieldVault = MockYieldVault(_yieldVault);
         reputationRegistry = ReputationRegistry(_reputationRegistry);
         creator = _creator;
+        randomnessProvider = IRandomnessProvider(_randomnessProvider);
+        registrationDeadline = block.timestamp + 30 days;
         params = _params;
         state = CircleState.OPEN;
 
@@ -143,26 +174,19 @@ contract SavingsCircle {
     }
 
     /**
-     * @notice Retorna el timestamp efectivo del contrato (incluyendo offset para demos interactivas).
+     * @notice Retorna exclusivamente el tiempo del bloque. La demo avanza Anvil por RPC.
      */
     function getCurrentTime() public view returns (uint256) {
-        return block.timestamp + virtualTimeOffset;
-    }
-
-    /**
-     * @notice Permite avanzar el reloj virtual del círculo para demostrar vencimientos, mora y cierres en vivo.
-     */
-    function advanceVirtualTime(uint256 secondsToAdd) external {
-        virtualTimeOffset += secondsToAdd;
-        emit VirtualTimeAdvanced(secondsToAdd, getCurrentTime());
+        return block.timestamp;
     }
 
     /**
      * @notice Inscribe a un participante en el círculo depositando la garantía inicial en la bóveda.
-     *         Al completarse el cupo N, ejecuta automáticamente el sorteo verificable e inicia la Ronda 1.
+     *         Al completarse el cupo N, congela las entradas y solicita aleatoriedad futura.
      */
     function joinCircle() external {
         if (state != CircleState.OPEN) revert CircleNotOpen();
+        if (block.timestamp >= registrationDeadline) revert RegistrationClosed();
         if (participantData[msg.sender].joined) revert AlreadyJoined();
 
         uint256 collateral = params.collateralAmount;
@@ -188,8 +212,36 @@ contract SavingsCircle {
         emit ParticipantJoined(msg.sender, participants.length, params.maxParticipants, collateral);
 
         if (participants.length == params.maxParticipants) {
-            _startCircleAndDrawTurns();
+            state = CircleState.DRAW_PENDING;
+            drawCommitment = keccak256(abi.encode(DRAW_VERSION, block.chainid, address(this), params, participants));
+            drawRequestId = randomnessProvider.requestRandomness(drawCommitment);
+            emit DrawRequested(drawRequestId, drawCommitment, randomnessProvider.isDemo());
         }
+    }
+
+    /// @notice Permissionless finalization; caller and time cannot affect the committed result.
+    function finalizeDraw() external {
+        if (state != CircleState.DRAW_PENDING) revert DrawNotPending();
+        (bool fulfilled, uint256 word) = randomnessProvider.getRandomness(drawRequestId);
+        if (!fulfilled) revert RandomnessNotReady();
+        bytes32 seed = keccak256(abi.encode(DRAW_VERSION, drawCommitment, drawRequestId, word));
+        _startCircleAndDrawTurns(seed);
+    }
+
+    /// @notice Only an unfilled circle can expire. Pending draws cannot be cancelled or repeated.
+    function cancelUnfilledCircle() external {
+        if (state != CircleState.OPEN || block.timestamp < registrationDeadline) revert CannotCancel();
+        state = CircleState.CANCELLED;
+        emit CircleCancelled();
+    }
+
+    function claimCancelledCollateral() external {
+        if (state != CircleState.CANCELLED) revert NoRefundAvailable();
+        uint256 amount = participantData[msg.sender].collateralBalance;
+        if (amount == 0) revert NoRefundAvailable();
+        participantData[msg.sender].collateralBalance = 0;
+        yieldVault.withdrawPrincipal(msg.sender, amount);
+        emit CollateralRefunded(msg.sender, amount);
     }
 
     /**
@@ -205,6 +257,7 @@ contract SavingsCircle {
         }
 
         uint256 nowTs = getCurrentTime();
+        if (nowTs >= roundSummaries[currentRound].endTime) revert RoundExpired();
         uint256 graceDeadline = currentRoundStart + params.gracePeriod;
         uint256 contribution = params.contributionAmount;
         uint256 penalty = 0;
@@ -268,13 +321,11 @@ contract SavingsCircle {
                     ParticipantInfo storage mInfo = participantData[member];
                     uint256 availableCollateral = mInfo.collateralBalance;
 
-                    uint256 coveredContribution = availableCollateral >= contribution
-                        ? contribution
-                        : availableCollateral;
+                    uint256 coveredContribution =
+                        availableCollateral >= contribution ? contribution : availableCollateral;
                     uint256 remainingAfterContribution = availableCollateral - coveredContribution;
-                    uint256 coveredPenalty = remainingAfterContribution >= penalty
-                        ? penalty
-                        : remainingAfterContribution;
+                    uint256 coveredPenalty =
+                        remainingAfterContribution >= penalty ? penalty : remainingAfterContribution;
 
                     uint256 totalDeducted = coveredContribution + coveredPenalty;
                     mInfo.collateralBalance -= totalDeducted;
@@ -321,29 +372,13 @@ contract SavingsCircle {
     }
 
     /**
-     * @dev Ejecuta el sorteo algorítmico verificable usando barajado Fisher-Yates e inicia la Ronda 1.
+     * @dev Fisher-Yates con rechazo de muestras para evitar sesgo modular.
      */
-    function _startCircleAndDrawTurns() internal {
+    function _startCircleAndDrawTurns(bytes32 seed) internal {
         state = CircleState.ACTIVE;
         uint256 n = participants.length;
-        turnOrder = new address[](n);
-        for (uint256 i = 0; i < n; i++) {
-            turnOrder[i] = participants[i];
-        }
-
-        // Semilla verificable combinando entropía del bloque, timestamp y lista de participantes
-        bytes32 seed = keccak256(
-            abi.encodePacked(block.prevrandao, getCurrentTime(), block.number, address(this), participants)
-        );
+        turnOrder = computeTurnOrder(participants, seed);
         verifiableSeed = seed;
-
-        // Algoritmo Fisher-Yates shuffle determinístico a partir de la semilla
-        for (uint256 i = n - 1; i > 0; i--) {
-            uint256 j = uint256(keccak256(abi.encodePacked(seed, i))) % (i + 1);
-            address temp = turnOrder[i];
-            turnOrder[i] = turnOrder[j];
-            turnOrder[j] = temp;
-        }
 
         for (uint256 i = 0; i < n; i++) {
             participantData[turnOrder[i]].assignedTurn = i + 1;
@@ -353,6 +388,25 @@ contract SavingsCircle {
         _initializeRound(1);
 
         emit VerifiableDrawCompleted(turnOrder, seed, currentRoundStart);
+    }
+
+    function computeTurnOrder(address[] memory members, bytes32 seed) public pure returns (address[] memory) {
+        if (members.length < 2 || members.length > 50) revert InvalidParameters();
+        uint256 counter;
+        for (uint256 i = members.length - 1; i > 0; i--) {
+            uint256 bound = i + 1;
+            uint256 threshold;
+            unchecked {
+                threshold = (0 - bound) % bound;
+            }
+            uint256 sample;
+            do {
+                sample = uint256(keccak256(abi.encode(seed, counter++)));
+            } while (sample < threshold);
+            uint256 j = sample % bound;
+            (members[i], members[j]) = (members[j], members[i]);
+        }
+        return members;
     }
 
     function _initializeRound(uint256 roundNum) internal {
@@ -448,6 +502,31 @@ contract SavingsCircle {
 
     function getTurnOrder() external view returns (address[] memory) {
         return turnOrder;
+    }
+
+    function getDrawDetails()
+        external
+        view
+        returns (
+            address provider,
+            bool demo,
+            uint256 requestId,
+            bytes32 commitment,
+            bool fulfilled,
+            uint256 word,
+            uint256 deadline
+        )
+    {
+        (fulfilled, word) = randomnessProvider.getRandomness(drawRequestId);
+        return (
+            address(randomnessProvider),
+            randomnessProvider.isDemo(),
+            drawRequestId,
+            drawCommitment,
+            fulfilled,
+            word,
+            registrationDeadline
+        );
     }
 
     function getAllParticipantsInfo() external view returns (ParticipantInfo[] memory list) {
